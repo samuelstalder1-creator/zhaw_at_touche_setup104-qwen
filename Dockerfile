@@ -20,8 +20,7 @@ for raw_line in source.read_text(encoding="utf-8").splitlines():
 target.write_text("\n".join(lines) + "\n", encoding="utf-8")
 PY
 
-# Use the CPU wheel so the build does not pull CUDA runtimes into the image.
-RUN pip3 install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu "torch==2.7.1+cpu"
+# Reuse the torch already shipped in the base image to keep the layer size down.
 RUN pip3 install --no-cache-dir -r /requirements-docker.txt
 RUN pip3 uninstall -y torchvision
 
