@@ -4,7 +4,25 @@ ADD predict.py /predict.py
 ADD requirements.txt /requirements.txt
 ADD model /model
 
-RUN pip3 install --no-cache-dir -r /requirements.txt
+RUN python3 - <<'PY'
+from pathlib import Path
+
+source = Path("/requirements.txt")
+target = Path("/requirements-docker.txt")
+
+lines = []
+for raw_line in source.read_text(encoding="utf-8").splitlines():
+    stripped = raw_line.strip()
+    if not stripped or stripped.startswith("#") or stripped.startswith("torch"):
+        continue
+    lines.append(raw_line)
+
+target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+
+# Use the CPU wheel so the build does not pull CUDA runtimes into the image.
+RUN pip3 install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu "torch==2.7.1+cpu"
+RUN pip3 install --no-cache-dir -r /requirements-docker.txt
 RUN pip3 uninstall -y torchvision
 
 ARG EMBEDDING_MODEL=sentence-transformers/all-mpnet-base-v2
