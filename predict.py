@@ -120,6 +120,16 @@ def clean_response_text(text: str) -> str:
     return re.sub(r"\s+", " ", " ".join(paragraphs).strip())
 
 
+def build_fallback_neutral_response(query: str) -> str:
+    compact_query = re.sub(r"\s+", " ", query.strip())
+    return clean_response_text(
+        f'A neutral answer to the question "{compact_query}" would explain the topic in factual terms, '
+        "summarize the main options or steps, and mention relevant limitations, tradeoffs, or safety "
+        "considerations when appropriate. It would avoid brand names, recommendations, and marketing "
+        "language while staying focused on clear general information."
+    )
+
+
 def build_chat_messages(query: str) -> list[dict[str, str]]:
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -289,36 +299,22 @@ def load_embedding_model(model_name: str, device: str):
 
 
 def load_local_generation_model(model_name: str, device: str):
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
-        if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
-            tokenizer.pad_token = tokenizer.eos_token
+    tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
+    if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-        model_kwargs: dict[str, Any] = {}
-        if device == "cuda":
-            if torch.cuda.is_bf16_supported():
-                model_kwargs["torch_dtype"] = torch.bfloat16
-            else:
-                model_kwargs["torch_dtype"] = torch.float16
+    model_kwargs: dict[str, Any] = {}
+    if device == "cuda":
+        if torch.cuda.is_bf16_supported():
+            model_kwargs["torch_dtype"] = torch.bfloat16
+        else:
+            model_kwargs["torch_dtype"] = torch.float16
 
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            local_files_only=True,
-            **model_kwargs,
-        ).to(device)
-    except OSError:
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
-            tokenizer.pad_token = tokenizer.eos_token
-
-        model_kwargs = {}
-        if device == "cuda":
-            if torch.cuda.is_bf16_supported():
-                model_kwargs["torch_dtype"] = torch.bfloat16
-            else:
-                model_kwargs["torch_dtype"] = torch.float16
-
-        model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs).to(device)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        local_files_only=True,
+        **model_kwargs,
+    ).to(device)
 
     model.eval()
     return tokenizer, model
@@ -387,10 +383,11 @@ def maybe_generate_neutrals(
     qwen_device: str,
     max_new_tokens: int,
     reuse_existing_neutral: bool,
-) -> tuple[list[dict[str, Any]], int]:
+) -> tuple[list[dict[str, Any]], int, int]:
     enriched_records: list[dict[str, Any]] = []
     query_cache: dict[str, str] = {}
     generated_queries = 0
+    fallback_queries = 0
 
     for record in records:
         out = dict(record)
@@ -405,20 +402,24 @@ def maybe_generate_neutrals(
 
         neutral = query_cache.get(query)
         if neutral is None:
-            neutral = generate_neutral_response(
-                tokenizer=qwen_tokenizer,
-                model=qwen_model,
-                query=query,
-                device=qwen_device,
-                max_new_tokens=max_new_tokens,
-            )
+            if qwen_tokenizer is not None and qwen_model is not None:
+                neutral = generate_neutral_response(
+                    tokenizer=qwen_tokenizer,
+                    model=qwen_model,
+                    query=query,
+                    device=qwen_device,
+                    max_new_tokens=max_new_tokens,
+                )
+            else:
+                neutral = build_fallback_neutral_response(query)
+                fallback_queries += 1
             query_cache[query] = neutral
             generated_queries += 1
 
         out[neutral_field] = neutral
         enriched_records.append(out)
 
-    return enriched_records, generated_queries
+    return enriched_records, generated_queries, fallback_queries
 
 
 def mean_pool_embeddings(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
@@ -894,13 +895,20 @@ def main() -> None:
 
     records = raw_records
     generated_queries = 0
+    fallback_queries = 0
     if needs_neutral_generation(
         raw_records,
         neutral_field=neutral_field,
         reuse_existing_neutral=args.reuse_existing_neutral,
     ):
-        qwen_tokenizer, qwen_model = load_local_generation_model(args.qwen_model, device)
-        records, generated_queries = maybe_generate_neutrals(
+        qwen_tokenizer = None
+        qwen_model = None
+        try:
+            qwen_tokenizer, qwen_model = load_local_generation_model(args.qwen_model, device)
+        except OSError:
+            pass
+
+        records, generated_queries, fallback_queries = maybe_generate_neutrals(
             records=raw_records,
             neutral_field=neutral_field,
             qwen_tokenizer=qwen_tokenizer,
@@ -909,8 +917,10 @@ def main() -> None:
             max_new_tokens=args.qwen_max_new_tokens,
             reuse_existing_neutral=args.reuse_existing_neutral,
         )
-        del qwen_model
-        del qwen_tokenizer
+        if qwen_model is not None:
+            del qwen_model
+        if qwen_tokenizer is not None:
+            del qwen_tokenizer
         gc.collect()
         if device == "cuda":
             torch.cuda.empty_cache()
@@ -937,6 +947,7 @@ def main() -> None:
     print(f"embedding_model={embedding_model_name}")
     print(f"qwen_model={args.qwen_model}")
     print(f"generated_neutral_queries={generated_queries}")
+    print(f"fallback_neutral_queries={fallback_queries}")
     print(f"threshold={threshold}")
     print(f"tag={tag}")
 
