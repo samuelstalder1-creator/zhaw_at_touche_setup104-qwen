@@ -120,16 +120,6 @@ def clean_response_text(text: str) -> str:
     return re.sub(r"\s+", " ", " ".join(paragraphs).strip())
 
 
-def build_fallback_neutral_response(query: str) -> str:
-    compact_query = re.sub(r"\s+", " ", query.strip())
-    return clean_response_text(
-        f'A neutral answer to the question "{compact_query}" would explain the topic in factual terms, '
-        "summarize the main options or steps, and mention relevant limitations, tradeoffs, or safety "
-        "considerations when appropriate. It would avoid brand names, recommendations, and marketing "
-        "language while staying focused on clear general information."
-    )
-
-
 def build_chat_messages(query: str) -> list[dict[str, str]]:
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -383,11 +373,10 @@ def maybe_generate_neutrals(
     qwen_device: str,
     max_new_tokens: int,
     reuse_existing_neutral: bool,
-) -> tuple[list[dict[str, Any]], int, int]:
+) -> tuple[list[dict[str, Any]], int]:
     enriched_records: list[dict[str, Any]] = []
     query_cache: dict[str, str] = {}
     generated_queries = 0
-    fallback_queries = 0
 
     for record in records:
         out = dict(record)
@@ -402,24 +391,20 @@ def maybe_generate_neutrals(
 
         neutral = query_cache.get(query)
         if neutral is None:
-            if qwen_tokenizer is not None and qwen_model is not None:
-                neutral = generate_neutral_response(
-                    tokenizer=qwen_tokenizer,
-                    model=qwen_model,
-                    query=query,
-                    device=qwen_device,
-                    max_new_tokens=max_new_tokens,
-                )
-            else:
-                neutral = build_fallback_neutral_response(query)
-                fallback_queries += 1
+            neutral = generate_neutral_response(
+                tokenizer=qwen_tokenizer,
+                model=qwen_model,
+                query=query,
+                device=qwen_device,
+                max_new_tokens=max_new_tokens,
+            )
             query_cache[query] = neutral
             generated_queries += 1
 
         out[neutral_field] = neutral
         enriched_records.append(out)
 
-    return enriched_records, generated_queries, fallback_queries
+    return enriched_records, generated_queries
 
 
 def mean_pool_embeddings(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
@@ -676,6 +661,36 @@ def build_feature_matrix(
     return feature_names, np.concatenate(feature_blocks, axis=1)
 
 
+def log_prediction_inputs(
+    *,
+    records: Sequence[Mapping[str, Any]],
+    state: Mapping[str, Any],
+) -> None:
+    trainer_type = str(state["trainer_type"])
+    response_field = str(state.get("response_field", "response"))
+    neutral_field = str(state.get("neutral_field", DEFAULT_NEUTRAL_FIELD))
+    aux_neutral_field = state.get("aux_neutral_field")
+    if aux_neutral_field is not None:
+        aux_neutral_field = str(aux_neutral_field)
+    query_field = str(state.get("query_field", "query"))
+
+    fields_to_log = [query_field, neutral_field, response_field]
+    if trainer_type in DUAL_FILE_TRAINERS and aux_neutral_field and aux_neutral_field not in fields_to_log:
+        fields_to_log.append(aux_neutral_field)
+
+    print("prediction_input_begin")
+    print(f"prediction_input_fields={','.join(['id', *fields_to_log])}")
+    for row_number, record in enumerate(records, start=1):
+        payload: dict[str, Any] = {
+            "row": row_number,
+            "id": record["id"],
+        }
+        for field in fields_to_log:
+            payload[field] = record.get(field)
+        print("prediction_input=" + json.dumps(payload, ensure_ascii=False))
+    print("prediction_input_end")
+
+
 def score_records(
     *,
     classifier,
@@ -895,20 +910,21 @@ def main() -> None:
 
     records = raw_records
     generated_queries = 0
-    fallback_queries = 0
     if needs_neutral_generation(
         raw_records,
         neutral_field=neutral_field,
         reuse_existing_neutral=args.reuse_existing_neutral,
     ):
-        qwen_tokenizer = None
-        qwen_model = None
         try:
             qwen_tokenizer, qwen_model = load_local_generation_model(args.qwen_model, device)
-        except OSError:
-            pass
+        except OSError as exc:
+            raise RuntimeError(
+                "Neutral generation requires a local Qwen model, but the configured weights could not be "
+                f"loaded from the container cache: {args.qwen_model}. Rebuild the image with the Qwen "
+                "weights preloaded or provide non-empty input qwen values."
+            ) from exc
 
-        records, generated_queries, fallback_queries = maybe_generate_neutrals(
+        records, generated_queries = maybe_generate_neutrals(
             records=raw_records,
             neutral_field=neutral_field,
             qwen_tokenizer=qwen_tokenizer,
@@ -925,6 +941,7 @@ def main() -> None:
         if device == "cuda":
             torch.cuda.empty_cache()
 
+    log_prediction_inputs(records=records, state=state)
     classifier = load_classifier_bundle(model_dir)
     embedding_tokenizer, embedding_model = load_embedding_model(embedding_model_name, device)
     labels = score_records(
@@ -947,7 +964,6 @@ def main() -> None:
     print(f"embedding_model={embedding_model_name}")
     print(f"qwen_model={args.qwen_model}")
     print(f"generated_neutral_queries={generated_queries}")
-    print(f"fallback_neutral_queries={fallback_queries}")
     print(f"threshold={threshold}")
     print(f"tag={tag}")
 
